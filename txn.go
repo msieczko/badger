@@ -20,9 +20,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"fmt"
 	"math"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -30,6 +32,13 @@ import (
 	"github.com/dgraph-io/ristretto/z"
 	"github.com/pkg/errors"
 )
+
+type UpdatedStruct struct {
+	count uint64
+	size  uint64
+}
+
+var txCounter = uint64(0)
 
 type oracle struct {
 	isManaged       bool // Does not change value, so no locking required.
@@ -247,6 +256,8 @@ func (o *oracle) doneCommit(cts uint64) {
 
 // Txn represents a Badger transaction.
 type Txn struct {
+	id       uint64
+	sizeMap  map[string]UpdatedStruct
 	readTs   uint64
 	commitTs uint64
 	size     int64
@@ -346,7 +357,35 @@ func (txn *Txn) checkSize(e *Entry) error {
 	count := txn.count + 1
 	// Extra bytes for the version in key.
 	size := txn.size + e.estimateSizeAndSetThreshold(txn.db.valueThreshold()) + 10
-	if count >= txn.db.opt.maxBatchCount || size >= txn.db.opt.maxBatchSize {
+
+	key := string(e.Key)
+	var name string
+	if strings.HasPrefix(key, "bh_") {
+		name = strings.Split(key, ":")[0]
+	} else if strings.HasPrefix(key, "_bhIndex") {
+		split := strings.Split(key, ":")
+		name = strings.Join(split[:3], ":")
+	} else {
+		name = "rest"
+	}
+
+	updatedStruct, ok := txn.sizeMap[name]
+	if !ok {
+		updatedStruct = UpdatedStruct{}
+	}
+	updatedStruct.count++
+	updatedStruct.size += uint64(size - txn.size)
+	txn.sizeMap[name] = updatedStruct
+
+	if count >= txn.db.opt.maxBatchCount {
+		fmt.Println("ErrTxnTooBig - COUNT")
+		printTxn(txn)
+		return ErrTxnTooBig
+	}
+
+	if size >= txn.db.opt.maxBatchSize {
+		fmt.Println("ErrTxnTooBig - SIZE")
+		printTxn(txn)
 		return ErrTxnTooBig
 	}
 	txn.count, txn.size = count, size
@@ -656,7 +695,15 @@ func (txn *Txn) commitPrecheck() error {
 //
 // If error is nil, the transaction is successfully committed. In case of a non-nil error, the LSM
 // tree won't be updated, so there's no need for any rollback.
+
+type SizeMsg struct {
+	size uint64
+	msg  string
+}
+
 func (txn *Txn) Commit() error {
+	printTxn(txn)
+
 	// txn.conflictKeys can be zero if conflict detection is turned off. So we
 	// should check txn.pendingWrites.
 	if len(txn.pendingWrites) == 0 {
@@ -677,6 +724,26 @@ func (txn *Txn) Commit() error {
 	// TODO: What if some of the txns successfully make it to value log, but others fail.
 	// Nothing gets updated to LSM, until a restart happens.
 	return txnCb()
+}
+
+func printTxn(txn *Txn) {
+	if txn.size > 1024 {
+		msgs := make([]SizeMsg, 0, len(txn.sizeMap))
+		for key, updatedStruct := range txn.sizeMap {
+			msg := fmt.Sprintf("Key: %s, Count: %d, Size: %d", key, updatedStruct.count, updatedStruct.size)
+			msgs = append(msgs, SizeMsg{updatedStruct.size, msg})
+		}
+
+		sort.Slice(msgs, func(i, j int) bool {
+			return msgs[i].size > msgs[j].size
+		})
+
+		fmt.Printf("\nCommit tx #%d\n", txn.id)
+		for _, msg := range msgs {
+			fmt.Println(msg.msg)
+		}
+		fmt.Printf("SUM: Count: %d, Size: %d\n\n", txn.count, txn.size)
+	}
 }
 
 type txnCb struct {
@@ -770,11 +837,15 @@ func (db *DB) newTransaction(update, isManaged bool) *Txn {
 		update = false
 	}
 
+	txCounter++
+
 	txn := &Txn{
-		update: update,
-		db:     db,
-		count:  1,                       // One extra entry for BitFin.
-		size:   int64(len(txnKey) + 10), // Some buffer for the extra entry.
+		id:      txCounter,
+		sizeMap: make(map[string]UpdatedStruct),
+		update:  update,
+		db:      db,
+		count:   1,                       // One extra entry for BitFin.
+		size:    int64(len(txnKey) + 10), // Some buffer for the extra entry.
 	}
 	if update {
 		if db.opt.DetectConflicts {
